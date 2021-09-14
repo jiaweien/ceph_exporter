@@ -1,6 +1,7 @@
 package collectors
 
 import (
+        "container/list"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -107,6 +108,11 @@ type OSDCollector struct {
 	// OSDBackfillFull flags if an OSD is backfill full
 	OSDBackfillFull *prometheus.GaugeVec
 
+        // add by jwn 20210906
+        // Navinfo Special flags Displays healthy nodes and OSD nodes in the cluster
+        NavinfoSpecStatus *prometheus.Desc
+        // add end
+
 	// OSDDownDesc displays OSDs present in the cluster in "down" state
 	OSDDownDesc *prometheus.Desc
 
@@ -148,6 +154,11 @@ func NewOSDCollector(conn Conn, cluster string, logger *logrus.Logger) *OSDColle
 	labels := make(prometheus.Labels)
 	labels["cluster"] = cluster
 	osdLabels := []string{"osd", "device_class", "host", "rack", "root"}
+        /* add by jwn 20210907 */
+	navinfoLabels := make(prometheus.Labels)
+	navinfoLabels["cluster"] = cluster
+	navinfoStatusLabels := []string{"allofosds", "unavailableosds", "allofhosts", "unavailablehosts"}
+        /* add end */
 
 	return &OSDCollector{
 		conn:   conn,
@@ -394,6 +405,15 @@ func NewOSDCollector(conn Conn, cluster string, logger *logrus.Logger) *OSDColle
 			append([]string{"status"}, osdLabels...),
 			labels,
 		),
+
+		/* add by jwn 20210906 */
+                NavinfoSpecStatus: prometheus.NewDesc(
+			fmt.Sprintf("%s_navinfo_spec_status", cephNamespace),
+			"Navinfo special cluster status",
+			navinfoStatusLabels,
+			navinfoLabels,
+		),
+		/* add end */
 
 		ScrubbingStateDesc: prometheus.NewDesc(
 			fmt.Sprintf("%s_osd_scrub_state", cephNamespace),
@@ -885,6 +905,68 @@ func (o *OSDCollector) getOSDLabelFromName(osdid string) *cephOSDLabel {
 	return o.getOSDLabelFromID(id)
 }
 
+/* add by jwn 20210906 */
+func (o *OSDCollector) collectNavinfoSpecStatus(ch chan<- prometheus.Metric) error {
+	cmd := o.cephOSDTreeCommand()
+	data, _, err := o.conn.MonCommand(cmd)
+	if err != nil {
+		o.logger.WithError(err).WithField(
+			"args", string(cmd),
+		).Error("error executing mon command")
+
+		return err
+	}
+
+	osdTree := &cephOSDTree{}
+	if err := json.Unmarshal(data, osdTree); err != nil {
+		return err
+	}
+
+        allOSD := 0
+	allHost := 0
+	unavailableHost := 0
+	childrenList := list.New()
+	var osdDownList = make(map[int64]string)
+	for _, devItem := range osdTree.Nodes {
+	    if devItem.Type == "osd" {
+	        allOSD++
+		if devItem.Status != "up" {
+		    //osdDownList.PushBack(devItem.id)
+		    osdDownList[devItem.ID] = "down"
+		}
+	    } else if devItem.Type == "host" {
+		allHost++
+		childrenList.PushBack(devItem.Children)
+	    } else {
+	        continue
+	    }
+        }
+
+        for children := childrenList.Front(); children != nil; children = children.Next() {
+            nHostOSD := 0
+            lChildren := children.Value.([]int64)
+            for _, id := range lChildren {
+                if _, ok := osdDownList[int64(id)]; ok {
+                    nHostOSD++
+                } else {
+                    break
+                }
+            }
+            if nHostOSD == len(lChildren) {
+                unavailableHost++
+            }
+        }
+
+        ch <- prometheus.MustNewConstMetric(o.NavinfoSpecStatus, prometheus.GaugeValue, 1,
+	    strconv.Itoa(allOSD),
+	    strconv.Itoa(len(osdDownList)),
+	    strconv.Itoa(allHost),
+	    strconv.Itoa(unavailableHost))
+
+	return nil
+}
+/* add end */
+
 func (o *OSDCollector) collectOSDTreeDown(ch chan<- prometheus.Metric) error {
 	cmd := o.cephOSDTreeCommand("down")
 	buff, _, err := o.conn.MonCommand(cmd)
@@ -1167,6 +1249,9 @@ func (o *OSDCollector) Describe(ch chan<- *prometheus.Desc) {
 		metric.Describe(ch)
 	}
 	ch <- o.OSDDownDesc
+/* add by jwn 20210907 */
+	ch <- o.NavinfoSpecStatus
+/* add end */
 	ch <- o.ScrubbingStateDesc
 	ch <- o.PGObjectsRecoveredDesc
 }
@@ -1209,6 +1294,13 @@ func (o *OSDCollector) Collect(ch chan<- prometheus.Metric) {
 	if err := o.collectOSDTreeDown(ch); err != nil {
 		o.logger.WithError(err).Error("error collecting OSD tree down metrics")
 	}
+
+        /* add by jwn 20210907 */
+	o.logger.Debug("collecting Navinfo special status metrics")
+	if err := o.collectNavinfoSpecStatus(ch); err != nil {
+		o.logger.WithError(err).Error("error collecting Navinfo special status metrics")
+	}
+        /* add end */
 
 	o.logger.Debug("collecting PG dump metrics")
 	if err := o.performPGDumpBrief(); err != nil {
